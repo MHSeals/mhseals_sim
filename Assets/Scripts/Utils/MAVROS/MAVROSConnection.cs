@@ -6,7 +6,10 @@ using System.Threading;
 using System.IO;
 using UnityEngine;
 using Sim.Utils;
+using Sim.Actuators.Motors;
 using Sim.Controllers;
+using Sim.Utils.Performance;
+using Sim.Utils.ROS;
 
 namespace Sim.Sensors.Nav
 {
@@ -29,6 +32,8 @@ namespace Sim.Sensors.Nav
 
     public class MAVROSConnection : MonoBehaviour
     {
+        private const UInt16 ServoPacketMagic = 18458;
+        private const int ServoPacketBytes = sizeof(UInt16) * 18 + sizeof(UInt32);
         [Header("Unity References")]
         [SerializeField] private Imu imu;
         [SerializeField] private OmniXController controller;
@@ -48,24 +53,36 @@ namespace Sim.Sensors.Nav
         private UdpClient socketSend;
         private Thread receiveThread;
         private Thread sendThread;
-        private bool runThreads = true;
+        private volatile bool runThreads = true;
+        private bool threadsStarted;
         private volatile bool hasRemoteConnection = false;
         private IPEndPoint remoteEndpoint = new(IPAddress.Any, 0);
 
         private SITLCommsJsonOutputPacket data = new();
         private readonly object dataLock = new();
-        private long startTime;
-
         private volatile bool receiveError;
         private string receiveErrorMessage;
         private volatile bool sendError;
         private string sendErrorMessage;
         private volatile bool newConnection;
         private string remoteEndpointString;
+        private readonly CraneQueuedAction<UInt16[]> pendingAction =
+            new(CraneActionPayloadEncoding.UInt16Array);
+        private IPhysicsBody telemetryBody;
 
         void Start()
         {
-            Debug.Log($"Starting MAVROS UDP threads on port {localPort}");
+            telemetryBody = imu != null ? imu.body : null;
+            if (telemetryBody == null || controller == null)
+                throw new MissingReferenceException(
+                    $"{name} SITL bridge requires a telemetry body and an Omni-X actuator.");
+            if (pwmMax <= pwmMin)
+                throw new InvalidOperationException(
+                    $"{name} SITL PWM range must satisfy max > min.");
+            if (hz <= 0f)
+                throw new InvalidOperationException($"{name} SITL telemetry rate must be positive.");
+            runThreads = true;
+            Debug.Log($"Starting ArduPilot JSON/SITL UDP threads on port {localPort}");
 
             socketReceive = new UdpClient(localPort);
             socketReceive.Client.ReceiveTimeout = 500;
@@ -78,12 +95,16 @@ namespace Sim.Sensors.Nav
             sendThread = new Thread(SendTelemetryLoop);
             sendThread.IsBackground = true;
             sendThread.Start();
+            threadsStarted = true;
 
-            startTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         }
 
         void OnDisable()
         {
+            if (!threadsStarted) {
+                pendingAction.Clear();
+                return;
+            }
             runThreads = false;
 
             try
@@ -99,7 +120,10 @@ namespace Sim.Sensors.Nav
             if (sendThread != null && sendThread.IsAlive)
                 sendThread.Join(200);
 
-            Debug.Log("Stopping MAVROS UDP threads");
+            pendingAction.Clear();
+            threadsStarted = false;
+
+            Debug.Log("Stopping ArduPilot JSON/SITL UDP threads");
         }
 
         void Update()
@@ -125,47 +149,59 @@ namespace Sim.Sensors.Nav
             // Update telemetry from Unity simulation
             lock (dataLock)
             {
-                data.timestamp = (DateTimeOffset.Now.ToUnixTimeMilliseconds() - startTime) / 1000f;
+                data.timestamp = (float)Clock.time;
 
                 data.imu.gyro = new float[]
                 {
-                    imu.body.angularVelocity.z * Mathf.Deg2Rad,
-                    imu.body.angularVelocity.x * Mathf.Deg2Rad,
-                    imu.body.angularVelocity.y * Mathf.Deg2Rad
+                    telemetryBody.angularVelocity.z,
+                    telemetryBody.angularVelocity.x,
+                    telemetryBody.angularVelocity.y
                 };
 
                 data.imu.accel_body = new float[] { 0.0f, 0.0f, -Constants.gravity };
 
                 data.position = new float[]
                 {
-                    imu.body.position.z,
-                    imu.body.position.x,
-                    imu.body.position.y
+                    telemetryBody.position.z,
+                    telemetryBody.position.x,
+                    telemetryBody.position.y
                 };
 
                 data.attitude = new float[]
                 {
-                    imu.body.transform.eulerAngles.z * Mathf.Deg2Rad,
-                    imu.body.transform.eulerAngles.x * Mathf.Deg2Rad,
-                    imu.body.transform.eulerAngles.y * Mathf.Deg2Rad
+                    telemetryBody.transform.eulerAngles.z * Mathf.Deg2Rad,
+                    telemetryBody.transform.eulerAngles.x * Mathf.Deg2Rad,
+                    telemetryBody.transform.eulerAngles.y * Mathf.Deg2Rad
                 };
 
                 data.velocity = new float[]
                 {
-                    imu.body.linearVelocity.z,
-                    imu.body.linearVelocity.x,
-                    imu.body.linearVelocity.y
+                    telemetryBody.linearVelocity.z,
+                    telemetryBody.linearVelocity.x,
+                    telemetryBody.linearVelocity.y
                 };
             }
         }
 
-        private float MapPWM(float pwm)
+        void FixedUpdate()
         {
-            pwm = Math.Clamp(pwm, pwmMin, pwmMax);
-            return controller.config.GetMinCommand() +
-                   (pwm - pwmMin) * (controller.config.GetMaxCommand() - controller.config.GetMinCommand()) /
-                   (pwmMax - pwmMin);
+            if (controller != null && controller.movementOverride) {
+                pendingAction.Clear();
+                return;
+            }
+            pendingAction.TryApply(ApplyPwm, out _);
         }
+
+        private void ApplyPwm(UInt16[] pwm) {
+            controller.frontLeft.SetCommand(MapPWM(pwm[1]));
+            controller.frontRight.SetCommand(MapPWM(pwm[2]));
+            controller.rearRight.SetCommand(MapPWM(pwm[3]));
+            controller.rearLeft.SetCommand(MapPWM(pwm[0]));
+        }
+
+        private float MapPWM(float pwm) =>
+            EscPwm.Linear(pwm, pwmMin, pwmMax, controller.config.GetMinCommand(),
+                controller.config.GetMaxCommand());
 
         private void ReceiveDataLoop()
         {
@@ -175,29 +211,39 @@ namespace Sim.Sensors.Nav
                 {
                     byte[] received = socketReceive.Receive(ref remoteEndpoint);
 
-                    if (!hasRemoteConnection)
-                    {
-                        hasRemoteConnection = true;
-
-                        newConnection = true;
-                        remoteEndpointString = remoteEndpoint.ToString();
+                    if (received.Length != ServoPacketBytes) {
+                        CraneRuntimeMetrics.ReportSitlServoPacket(false, -1);
+                        receiveErrorMessage = $"invalid SITL servo packet length {received.Length}; " +
+                                              $"expected {ServoPacketBytes}";
+                        receiveError = true;
+                        continue;
                     }
 
                     using var reader = new BinaryReader(new MemoryStream(received), Encoding.UTF8, false);
                     UInt16 magic = reader.ReadUInt16();
                     UInt16 frameRate = reader.ReadUInt16();
                     UInt32 frameCount = reader.ReadUInt32();
+                    if (magic != ServoPacketMagic || frameRate == 0) {
+                        CraneRuntimeMetrics.ReportSitlServoPacket(false, frameCount);
+                        receiveErrorMessage = $"invalid SITL servo header magic={magic} " +
+                                              $"frameRate={frameRate}";
+                        receiveError = true;
+                        continue;
+                    }
+
+                    if (!hasRemoteConnection)
+                    {
+                        remoteEndpointString = remoteEndpoint.ToString();
+                        newConnection = true;
+                        hasRemoteConnection = true;
+                    }
+
                     UInt16[] pwm = new UInt16[16];
                     for (int i = 0; i < 16; i++)
                         pwm[i] = reader.ReadUInt16();
 
-                    if (!controller.movementOverride)
-                    {
-                        controller.frontLeft.SetCommand(MapPWM(pwm[1]));
-                        controller.frontRight.SetCommand(MapPWM(pwm[2]));
-                        controller.rearRight.SetCommand(MapPWM(pwm[3]));
-                        controller.rearLeft.SetCommand(MapPWM(pwm[0]));
-                    }
+                    pendingAction.Receive(pwm, "sitl:pwm", frameCount, -1);
+                    CraneRuntimeMetrics.ReportSitlServoPacket(true, frameCount);
                 }
                 catch (SocketException ex)
                 {
@@ -211,8 +257,8 @@ namespace Sim.Sensors.Nav
                 }
                 catch (Exception ex)
                 {
-                    receiveError = true;
                     receiveErrorMessage = ex.Message;
+                    receiveError = true;
                 }
             }
         }
@@ -238,11 +284,12 @@ namespace Sim.Sensors.Nav
                         string jsonStr = JsonUtility.ToJson(snapshot) + "\n";
                         byte[] bytes = Encoding.UTF8.GetBytes(jsonStr);
                         socketSend.Send(bytes, bytes.Length, remoteEndpoint);
+                        CraneRuntimeMetrics.ReportSitlTelemetry(snapshot.timestamp);
                     }
                     catch (Exception ex)
                     {
-                        sendError = true;
                         sendErrorMessage = ex.Message;
+                        sendError = true;
                         hasRemoteConnection = false;
                     }
                 }

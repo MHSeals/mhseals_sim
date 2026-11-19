@@ -63,33 +63,35 @@ namespace Sim.Controllers {
 
         // TODO: More accurately model desired linear and angular velocity (not just full forward throttle/backward/angular)
         public void SetMotion(Vector3 linear, Vector3 angular) {
-            // Debug.Log(linear.x + " " + linear.y + " " + angular.z);
-            if (angular.z != 0) {
-                // Only as good at generating torque as the magnitude of the cross product of the radius and force vectors
-                float frd = angular.z * config.GetMaxCommand();
-                float fld = -frd;
+            float[] c = new float[4];
+            Mix(linear, angular, config.GetMaxCommand(), c);
+            frontLeft.SetCommand(c[0]);
+            frontRight.SetCommand(c[1]);
+            rearRight.SetCommand(c[2]);
+            rearLeft.SetCommand(c[3]);
+        }
 
-                frontRight.SetCommand(frd);
-                rearLeft.SetCommand(frd);
-
-                frontLeft.SetCommand(fld);
-                rearRight.SetCommand(fld);
-            }
-            else {
-                float cX = linear.x * config.GetMaxCommand();
-                float cY = linear.y * config.GetMaxCommand();
-
-                frontLeft.SetCommand(-cX - cY);
-                frontRight.SetCommand(cX - cY);
-                rearLeft.SetCommand(-cX + cY);
-                rearRight.SetCommand(cX + cY);
-
-                // Outward pointing thrusters
-                // frontLeft.SetCommand(cX - cY);
-                // frontRight.SetCommand(-cX - cY);
-                // rearLeft.SetCommand(cX + cY);
-                // rearRight.SetCommand(-cX + cY);
-            }
+        /// <summary>
+        /// The mixer behind <see cref="SetMotion"/> as a pure function; result order is thruster
+        /// position FL, FR, RR, RL. Combines translation and yaw before saturation: the previous
+        /// mutually exclusive branches discarded Nav2 forward velocity whenever angular.z was
+        /// non-zero, making curved paths impossible.
+        /// </summary>
+        public static void Mix(Vector3 linear, Vector3 angular, float maximum, float[] result) {
+            float x = linear.x;
+            float y = linear.y;
+            float yaw = angular.z;
+            float fl = -x - y - yaw;
+            float fr = x - y + yaw;
+            float rl = -x + y + yaw;
+            float rr = x + y - yaw;
+            float peak = Mathf.Max(1f, Mathf.Abs(fl), Mathf.Abs(fr), Mathf.Abs(rl),
+                Mathf.Abs(rr));
+            float scale = maximum / peak;
+            result[0] = fl * scale;
+            result[1] = fr * scale;
+            result[2] = rr * scale;
+            result[3] = rl * scale;
         }
     }
 }

@@ -35,6 +35,12 @@ git-filter-repo
 /[Bb]uilds/
 /[Ll]ogs/
 /[Uu]ser[Ss]ettings/
+/PerformanceResults/
+/Assets/Generated/
+/Assets/Generated.meta
+__pycache__/
+*.py[cod]
+*.slnx
 
 # MemoryCaptures can get excessive in size.
 # They also could contain extremely sensitive data
@@ -59,6 +65,7 @@ git-filter-repo
 ExportedObj/
 .consulo/
 *.csproj
+!Tools/RoboBoat/cli/coursegen.csproj
 *.unityproj
 *.sln
 *.suo
@@ -101,3 +108,18 @@ UserSettings/EditorUserSettings.asset
 UserSettings/Layouts/default-2023.dwlt
 ProjectSettings/TimeManager.asset
 ProjectSettings/DynamicsManager.asset
+
+# Optional locally licensed campus visual packs; never redistribute implicitly.
+/Assets/LocalCampusVisuals/
+/Assets/LocalCampusVisuals.meta
+
+# Tools/Rig host overlay
+Tools/Rig/rig.local.yaml
+__pycache__/
+
+# Course generator version for player builds (CranePerformanceBuild writes and removes it)
+/Assets/Generated/
+/Assets/Generated.meta
+
+# the plugin package (pyproject.toml) when pip-installed in place
+*.egg-info/

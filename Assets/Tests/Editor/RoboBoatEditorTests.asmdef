@@ -1,0 +1,19 @@
+{
+    "name": "RoboBoatEditorTests",
+    "references": [
+        "ControllerAssembly",
+        "SensorsAssembly",
+        "MotorsAssembly",
+        "PhysicsAssembly",
+        "PerformanceAssembly",
+        "UtilsAssembly",
+        "Unity.InputSystem",
+        "Unity.Robotics.ROSTCPConnector.Messages"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ]
+}

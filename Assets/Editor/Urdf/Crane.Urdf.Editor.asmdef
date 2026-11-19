@@ -1,0 +1,21 @@
+{
+    "name": "Crane.Urdf.Editor",
+    "rootNamespace": "Crane.Urdf",
+    "references": [
+        "Unity.Robotics.UrdfImporter",
+        "Unity.Robotics.UrdfImporter.Editor",
+        "PhysicsCoreAssembly",
+        "MotorsAssembly"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

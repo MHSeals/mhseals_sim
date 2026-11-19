@@ -1,8 +1,12 @@
 using RosMessageTypes.Vision;
 using RosMessageTypes.Geometry;
 using Sim.Utils.ROS;
+using Sim.Utils.Performance;
 using UnityEngine;
+using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 
 namespace Sim.Sensors.Vision {
     [System.Serializable]
@@ -11,7 +15,101 @@ namespace Sim.Sensors.Vision {
         public string id;
     }
 
-    public class BoundingBox3D : MonoBehaviour {
+    /// <summary>A detectable object whose label is read at publish time (so it follows the
+    /// object's state, e.g. a light's colour) and whose Detection3D id is opaque: it carries
+    /// no colour or numeral.</summary>
+    public readonly struct DetectionTarget {
+        public readonly GameObject Object;
+        public readonly Func<string> Label;
+        public readonly int OpaqueId;
+
+        public DetectionTarget(GameObject target, Func<string> label, int opaqueId) {
+            Object = target; Label = label; OpaqueId = opaqueId;
+        }
+    }
+
+    public class BoundingBox3D : MonoBehaviour, ICraneEpisodeResettable {
+        [Serializable]
+        private sealed class VisibilityValidationResult {
+            public string schema = "crane-detection-visibility-validation-v1";
+            public float clearFraction;
+            public float centerOccludedFraction;
+            public float fullyOccludedFraction;
+            public bool valid;
+        }
+
+        private static bool visibilityValidationInstalled;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+        private static void InstallVisibilityValidation() {
+            string[] args = Environment.GetCommandLineArgs();
+            if (visibilityValidationInstalled ||
+                Array.IndexOf(args, "--crane-detection-visibility-validation") < 0) return;
+            visibilityValidationInstalled = true;
+
+            var host = new GameObject("CRANE Detection Visibility Validation");
+            host.SetActive(false);
+            Camera camera = host.AddComponent<Camera>();
+            camera.enabled = false;
+            var sensor = host.AddComponent<BoundingBox3D>();
+            sensor.sensorCamera = camera;
+            sensor.maxPartialVisibilitySamples = 4;
+            sensor.minimumVisibleFraction = 0.2f;
+            sensor.enabled = false;
+
+            var target = new GameObject("Semantic Target");
+            for (int i = 0; i < 2; i++) {
+                GameObject part = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                part.name = $"Target Part {i}";
+                part.transform.SetParent(target.transform);
+                part.transform.position = new Vector3(i == 0 ? -1f : 1f, 0f, 10f);
+            }
+            GameObject occluder = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            occluder.name = "Visibility Occluder";
+            occluder.transform.position = new Vector3(0f, 0f, 5f);
+
+            host.SetActive(true);
+            sensor.StartCoroutine(sensor.ValidateVisibility(target, occluder, ReadArgument(args,
+                "--crane-detection-visibility-validation-output")));
+        }
+
+        private IEnumerator ValidateVisibility(GameObject target, GameObject occluder,
+            string outputPath) {
+            yield return new WaitForFixedUpdate();
+            Physics.SyncTransforms();
+            Bounds bounds = ComputeWorldBounds(target);
+            occluder.SetActive(false);
+            Physics.SyncTransforms();
+            float clear = CalculateVisibleFraction(target, bounds.center);
+            occluder.SetActive(true);
+            occluder.transform.localScale = new Vector3(0.6f, 4f, 0.5f);
+            Physics.SyncTransforms();
+            float partial = CalculateVisibleFraction(target, bounds.center);
+            occluder.transform.localScale = new Vector3(4f, 4f, 0.5f);
+            Physics.SyncTransforms();
+            float blocked = CalculateVisibleFraction(target, bounds.center);
+            var result = new VisibilityValidationResult {
+                clearFraction = clear,
+                centerOccludedFraction = partial,
+                fullyOccludedFraction = blocked,
+                valid = clear == 1f && partial > 0f && blocked == 0f
+            };
+            string json = JsonUtility.ToJson(result, true);
+            Debug.Log($"CRANE_DETECTION_VISIBILITY_VALIDATION {json}");
+            if (!string.IsNullOrWhiteSpace(outputPath)) {
+                string path = Path.GetFullPath(outputPath);
+                string directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                File.WriteAllText(path, json);
+            }
+            Application.Quit(result.valid ? 0 : 2);
+        }
+
+        private static string ReadArgument(string[] args, string key) {
+            int index = Array.IndexOf(args, key);
+            return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+        }
+
         [SerializeField] private string topicName = "/detections";
         [SerializeField] private string frameId = "front_camera_link";
         [SerializeField] private Camera sensorCamera;
@@ -19,6 +117,9 @@ namespace Sim.Sensors.Vision {
 
         [SerializeField] private float minDist = 1f;
         [SerializeField] private float maxDist = 20f;
+        [SerializeField] private LayerMask occlusionMask = ~0;
+        [SerializeField, Min(1)] private int maxPartialVisibilitySamples = 4;
+        [SerializeField, Range(0f, 1f)] private float minimumVisibleFraction = 0.2f;
 
         [SerializeField] private bool drawGizmos = true;
         [SerializeField] private float gizmoScale = 0.05f;
@@ -27,12 +128,23 @@ namespace Sim.Sensors.Vision {
         private float timeSincePublish;
 
         [SerializeField] private List<ObjectEntry> objects = new();
-        private Dictionary<GameObject, string> objectDict = new();
+        private Dictionary<GameObject, DetectionTarget> objectDict = new();
+        private readonly Dictionary<GameObject, Renderer[]> renderersByObject = new();
+        public int ResetPriority => -70;
+        public void CaptureEpisodeInitialState() { }
+        public void ResetEpisode(in CraneEpisodeResetContext context,
+            CraneEpisodeResetPhase phase) {
+            if (phase == CraneEpisodeResetPhase.BeforePhysics) timeSincePublish = 0;
+        }
 
         private void Awake() {
-            foreach (var entry in objects) {
-                if (entry.obj != null && !string.IsNullOrEmpty(entry.id))
-                    objectDict[entry.obj] = entry.id;
+            for (int i = 0; i < objects.Count; i++) {
+                var entry = objects[i];
+                if (entry.obj != null && !string.IsNullOrEmpty(entry.id)) {
+                    string label = entry.id;
+                    objectDict[entry.obj] = new DetectionTarget(entry.obj, () => label, i);
+                    renderersByObject[entry.obj] = entry.obj.GetComponentsInChildren<Renderer>();
+                }
             }
 
             if (sensorCamera == null) {
@@ -44,6 +156,27 @@ namespace Sim.Sensors.Vision {
             publisher = gameObject.AddComponent<ROSPublisher>();
         }
 
+        /// <summary>Replace every labelled target, e.g. with a course built at runtime.</summary>
+        public void ReplaceTargets(IEnumerable<KeyValuePair<GameObject, string>> targets) {
+            int index = 0;
+            var list = new List<DetectionTarget>();
+            foreach (var (target, label) in targets) list.Add(new DetectionTarget(target, () => label, index++));
+            ReplaceTargets(list);
+        }
+
+        /// <summary>Replace every target with state-following labels and opaque ids.</summary>
+        public void ReplaceTargets(IEnumerable<DetectionTarget> targets) {
+            objectDict.Clear();
+            renderersByObject.Clear();
+            objects.Clear();
+            foreach (var target in targets) {
+                if (target.Object == null || target.Label == null) continue;
+                objectDict[target.Object] = target;
+                renderersByObject[target.Object] = target.Object.GetComponentsInChildren<Renderer>();
+                objects.Add(new ObjectEntry { obj = target.Object, id = target.Label() });
+            }
+        }
+
         private void Start() {
             publisher.Initialize(topicName, frameId, CreateMessage, Hz, true);
         }
@@ -52,7 +185,7 @@ namespace Sim.Sensors.Vision {
             timeSincePublish += Time.fixedDeltaTime;
             if (timeSincePublish >= 1f / Hz) {
                 publisher.Publish();
-                timeSincePublish = 0f;
+                timeSincePublish -= 1f / Hz;
             }
         }
 
@@ -108,27 +241,28 @@ namespace Sim.Sensors.Vision {
         }
 
         private Detection3DArrayMsg CreateMessage() {
+            using var marker = CraneProfiler.OtherSensor.Auto();
+            using var sensorMarker = CraneProfiler.Detection.Auto();
             List<Detection3DMsg> detections = new();
+            Plane[] frustumPlanes = GeometryUtility.CalculateFrustumPlanes(sensorCamera);
 
             foreach (var kvp in objectDict) {
                 GameObject obj = kvp.Key;
-                string id = kvp.Value;
+                string label = kvp.Value.Label();
+                if (string.IsNullOrEmpty(label)) continue;
 
                 ComputeLocalBounds(obj, out Vector3 localCenter, out Vector3 localSize);
 
                 Vector3 worldCenter = obj.transform.TransformPoint(localCenter);
 
-                Vector3 screenPoint = sensorCamera.WorldToViewportPoint(worldCenter);
-                bool visible =
-                    screenPoint.z > 0 &&
-                    screenPoint.x > 0 && screenPoint.x < 1 &&
-                    screenPoint.y > 0 && screenPoint.y < 1;
-
                 float dist = Vector3.Magnitude(worldCenter - sensorCamera.transform.position);
                 bool inRange = minDist <= dist && dist <= maxDist;
+                Bounds worldBounds = ComputeWorldBounds(obj);
+                bool inFrustum = GeometryUtility.TestPlanesAABB(frustumPlanes, worldBounds);
 
-                if (!visible || !inRange)
-                    continue;
+                if (!inFrustum || !inRange) continue;
+                float visibleFraction = CalculateVisibleFraction(obj, worldBounds.center);
+                if (visibleFraction < minimumVisibleFraction) continue;
 
                 // Transform to camera frame
                 Vector3 cameraSpaceCenter =
@@ -136,17 +270,23 @@ namespace Sim.Sensors.Vision {
 
                 // Rotation in camera frame
                 Quaternion cameraSpaceRotation =
-                    Quaternion.Inverse(obj.transform.rotation) *
-                    sensorCamera.transform.rotation;
+                    Quaternion.Inverse(sensorCamera.transform.rotation) *
+                    obj.transform.rotation;
 
                 // Convert to ROS
                 Vector3 rosPosition = UnityToROSPosition(cameraSpaceCenter);
                 Quaternion rosRotation = UnityToROSRotation(cameraSpaceRotation);
 
                 detections.Add(
-                    GenerateDetection(rosPosition, rosRotation, localSize, id)
+                    GenerateDetection(rosPosition, rosRotation,
+                        new Vector3(localSize.z, localSize.x, localSize.y), label,
+                        kvp.Value.OpaqueId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        CalculateConfidence(dist, visibleFraction))
                 );
             }
+
+            CraneRuntimeMetrics.ReportDetections(detections.Count,
+                CraneRuntimeMetrics.SimulationTick);
 
             return new Detection3DArrayMsg(
                 publisher.CreateHeader(),
@@ -158,7 +298,9 @@ namespace Sim.Sensors.Vision {
             Vector3 rosPosition,
             Quaternion rosRotation,
             Vector3 size,
-            string id) {
+            string label,
+            string opaqueId,
+            float confidence) {
             PoseMsg pose = new(
                 new PointMsg(rosPosition.x, rosPosition.y, rosPosition.z),
                 new QuaternionMsg(rosRotation.x, rosRotation.y, rosRotation.z, rosRotation.w)
@@ -168,7 +310,7 @@ namespace Sim.Sensors.Vision {
 
             ObjectHypothesisWithPoseMsg hypothesis =
                 new(
-                    new ObjectHypothesisMsg(id, 1.0f),
+                    new ObjectHypothesisMsg(label, confidence),
                     new PoseWithCovarianceMsg(pose, covariance)
                 );
 
@@ -181,15 +323,62 @@ namespace Sim.Sensors.Vision {
                 publisher.CreateHeader(),
                 new[] { hypothesis },
                 bbox,
-                id
+                opaqueId
             );
+        }
+
+        private bool HasLineOfSight(GameObject target, Vector3 sample) {
+            Vector3 origin = sensorCamera.transform.position;
+            Vector3 offset = sample - origin;
+            float distance = offset.magnitude;
+            if (distance <= Mathf.Epsilon) return true;
+            return !UnityEngine.Physics.Raycast(origin, offset / distance, out RaycastHit hit,
+                       distance, occlusionMask, QueryTriggerInteraction.Ignore) ||
+                   hit.distance >= distance - 0.02f ||
+                   hit.transform == target.transform || hit.transform.IsChildOf(target.transform);
+        }
+
+        private float CalculateVisibleFraction(GameObject target, Vector3 center) {
+            if (HasLineOfSight(target, center)) return 1f;
+
+            Renderer[] renderers = GetRenderers(target);
+            int sampleCount = Mathf.Min(maxPartialVisibilitySamples, renderers.Length);
+            if (sampleCount == 0) return 0f;
+            int visibleSamples = 0;
+            for (int i = 0; i < sampleCount; i++) {
+                int rendererIndex = sampleCount == 1 ? 0 : Mathf.RoundToInt(
+                    i * (renderers.Length - 1f) / (sampleCount - 1));
+                if (HasLineOfSight(target, renderers[rendererIndex].bounds.center))
+                    visibleSamples++;
+            }
+            return visibleSamples / (float)sampleCount;
+        }
+
+        private float CalculateConfidence(float distance, float visibleFraction) {
+            float rangeQuality = 1f - Mathf.InverseLerp(minDist, maxDist, distance);
+            return Mathf.Clamp01((0.8f + 0.2f * rangeQuality) * visibleFraction);
+        }
+
+        private Bounds ComputeWorldBounds(GameObject obj) {
+            Renderer[] renderers = GetRenderers(obj);
+            if (renderers.Length == 0) return new Bounds(obj.transform.position, Vector3.zero);
+            Bounds bounds = renderers[0].bounds;
+            for (int i = 1; i < renderers.Length; i++) bounds.Encapsulate(renderers[i].bounds);
+            return bounds;
+        }
+
+        private Renderer[] GetRenderers(GameObject obj) {
+            if (renderersByObject.TryGetValue(obj, out Renderer[] renderers)) return renderers;
+            renderers = obj.GetComponentsInChildren<Renderer>();
+            renderersByObject[obj] = renderers;
+            return renderers;
         }
 
         private void ComputeLocalBounds(
             GameObject obj,
             out Vector3 center,
             out Vector3 size) {
-            Renderer[] renderers = obj.GetComponentsInChildren<Renderer>();
+            Renderer[] renderers = GetRenderers(obj);
 
             if (renderers.Length == 0) {
                 center = Vector3.zero;
@@ -227,13 +416,15 @@ namespace Sim.Sensors.Vision {
             size = max - min;
         }
 
-        private Vector3 UnityToROSPosition(Vector3 unityPos) {
-            return new Vector3(unityPos.x, unityPos.z, unityPos.y);
+        // The camera looks along its +z with +y up; front_camera_link is REP-103 FLU
+        // (x forward, y left, z up), so a Unity (x, y, z) is ROS (z, -x, y).
+        public static Vector3 UnityToROSPosition(Vector3 unityPos) {
+            return new Vector3(unityPos.z, -unityPos.x, unityPos.y);
         }
 
-        private Quaternion UnityToROSRotation(Quaternion unityRot) {
-            return Quaternion.AngleAxis(-90f, Vector3.forward) * Quaternion.AngleAxis(-90f, Vector3.up) * Quaternion.AngleAxis(-90f, Vector3.forward) * unityRot;
+        // The same change of basis for rotations; it reverses handedness, hence -w.
+        public static Quaternion UnityToROSRotation(Quaternion unityRot) {
+            return new Quaternion(unityRot.z, -unityRot.x, unityRot.y, -unityRot.w);
         }
     }
 }
-

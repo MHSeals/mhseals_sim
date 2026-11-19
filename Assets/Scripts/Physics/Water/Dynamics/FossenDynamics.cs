@@ -1,9 +1,15 @@
 using System;
 using UnityEngine;
+using Sim.Utils.Performance;
 using Unity.Robotics.ROSTCPConnector.ROSGeometry;
 using Sim.Utils;
 
 namespace Sim.Physics.Water.Dynamics {
+    /// <summary>
+    /// DEPRECATED, replaced by <see cref="MarineHydrodynamics"/> in the plant. It applies +M_A·ν̇
+    /// (wrong sign), keeps pre-reset state and reads surge from the mesh's sway axis (I1 V1/V2).
+    /// The boat bootstrap disables it at runtime; delete it once Blastoise.prefab drops it.
+    /// </summary>
     public class FossenDynamics : MonoBehaviour {
         [Header("Features")]
         [SerializeField] private bool Damping = true;
@@ -75,6 +81,8 @@ namespace Sim.Physics.Water.Dynamics {
         }
 
         private void FixedUpdate() {
+            using var marker = CraneProfiler.VehicleDynamics.Auto();
+            using var componentMarker = CraneProfiler.VehicleDynamicsFossen.Auto();
             state = GetState();
             stateDot = GetStateDot(state, statePrev, Time.deltaTime);
             Cor = CalculateCoriolisMatrix(state);
