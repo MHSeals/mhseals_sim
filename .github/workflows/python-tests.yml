@@ -1,0 +1,45 @@
+# Python tests for the course tools, boat characterization and Nav2 helpers.
+# Unity EditMode tests need an editor licence, so they run locally (see README "Tests").
+name: python-tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: Tools/RoboBoat/cli/global.json
+      - name: Install test dependencies
+        run: python -m pip install numpy pyyaml pytest
+      - name: Course tools
+        run: python -m pytest -q -p no:cacheprovider Tools/RoboBoat/tests
+      - name: Boat characterization
+        run: python -m pytest -q -p no:cacheprovider Tools/Characterization
+      - name: Nav2 helpers
+        run: python -m pytest -q -p no:cacheprovider Tools/Performance
+  installer-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: shellcheck
+        run: shellcheck install/install.sh
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path install/install.ps1 -Severity Error
+          $r | Format-Table -AutoSize
+          if ($r) { exit 1 }
