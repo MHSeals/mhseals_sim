@@ -17,13 +17,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: actions/setup-dotnet@v4
-        with:
-          global-json-file: Tools/RoboBoat/cli/global.json
       - name: Install test dependencies
         run: python -m pip install numpy pyyaml pytest
       - name: Course tools
-        run: python -m pytest -q -p no:cacheprovider Tools/RoboBoat/tests
+        # coursegen (CourseGenCli) links Unity's UnityEngine.CoreModule.dll, which runners don't have.
+        run: python -m pytest -q -p no:cacheprovider Tools/RoboBoat/tests -k "not CourseGenCli"
       - name: Boat characterization
         run: python -m pytest -q -p no:cacheprovider Tools/Characterization
       - name: Nav2 helpers

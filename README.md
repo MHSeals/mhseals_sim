@@ -108,7 +108,7 @@ Tools/RoboBoat/generate.sh --family roboboat_2026 --seed 7 --out course.json   #
 python3 Tools/RoboBoat/validate.py course.json                                 # check it against the spec
 ```
 
-Without Unity installed, `Tools/RoboBoat/cli` (coursegen) produces the same files.
+`Tools/RoboBoat/cli` (coursegen, .NET 10) writes the same files without opening the editor. It still needs the Unity install for `UnityEngine.CoreModule.dll`.
 
 See [Docs/Course.md](Docs/Course.md).
 
